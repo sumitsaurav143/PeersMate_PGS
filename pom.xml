@@ -10,7 +10,7 @@
 	</parent>
 	<groupId>com.sumit</groupId>
 	<artifactId>PeersMate</artifactId>
-	<version>0.0.4</version>
+	<version>0.0.5</version>
 	<name>PeersMate Automation Tool</name>
 	<description>Peers Automation Tool</description>
 	<url/>

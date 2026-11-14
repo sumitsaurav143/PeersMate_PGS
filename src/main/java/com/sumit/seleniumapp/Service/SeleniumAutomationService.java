@@ -2,6 +2,7 @@ package com.sumit.seleniumapp.Service;
 
 import com.sumit.seleniumapp.Controller.AutomationStatusStream;
 import com.sumit.seleniumapp.Factory.DriverFactory;
+import com.sumit.seleniumapp.Dto.AutomationProgress;
 import com.sumit.seleniumapp.Util.ExcelUtil;
 import com.sumit.seleniumapp.Util.LoginDetails;
 import org.openqa.selenium.*;
@@ -13,6 +14,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.Duration;
 import java.util.*;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 @Service
@@ -30,15 +32,7 @@ public class SeleniumAutomationService {
     @Autowired
     AutomationStatusStream automationStatusStream;
 
-    public boolean isAutomationEnabled = false;
-
-    int countFailed = 0;
-
-    int errorMsgCount = 0;
-
-    List<String> errorFarmers = new ArrayList<>();
-
-    List<Map<String, String>> fallbackFarmers = new ArrayList<>();
+    public volatile boolean isAutomationEnabled = false;
 
     WebDriver driver;
 
@@ -46,6 +40,7 @@ public class SeleniumAutomationService {
             LoggerFactory.getLogger(SeleniumAutomationService.class);
 
     private static final int CAPTCHA_LENGTH = 5;
+    private static final int MAX_LOOKUP_ATTEMPTS = 3;
 
     public void stopAutomation() throws Exception {
         isAutomationEnabled = false;
@@ -53,12 +48,23 @@ public class SeleniumAutomationService {
         driver.quit();
     }
 
-    public void runAutomation(String userId, String password, String year, String season, String month, String fromDate, String toDate, String filePath) throws Exception {
+    public void runAutomation(String userId, String password, String year, String season, String month,
+                              String fromDate, String toDate, String filePath,
+                              Consumer<AutomationProgress> progressListener) throws Exception {
 
         /* =========================
            INIT DRIVER
            ========================= */
         isAutomationEnabled= true;
+
+        List<Integer> excelRows = excelUtil.getDataRowIndexes(filePath);
+        int totalExcelRows = excelRows.size();
+        int processedRows = 0;
+        int successfulRows = 0;
+        int failedRows = 0;
+        int skippedRows = 0;
+        publishProgress(progressListener, totalExcelRows, processedRows, successfulRows,
+                failedRows, skippedRows, "");
 
         driver = driverFactory.createDriver();
         WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(12));
@@ -189,66 +195,107 @@ public class SeleniumAutomationService {
 
         log.info("Total farmers to process: " + allFarmers.size());
 
-        int totalExcelRows = excelUtil.getRowCount(filePath);
         log.info("Total farmers found in Excel: {}", totalExcelRows);
 
-        Set<String> usedFarmers = new HashSet<>();
-
-        boolean allSuccess = true;
-
+        List<Integer> successfulRowIndexes = new ArrayList<>();
 
         if (totalExcelRows>0) {
             log.info("Proceeding farmers details from Excel");
-            for (int row = 1; row <= totalExcelRows; row++) {
+            for (int row : excelRows) {
 
                 if(!isAutomationEnabled){
-                    allSuccess=false;
                     break;
                 }
 
                 log.info("===== Processing Farmer Row {} =====", row);
 
+                String currentRow = "Row " + row;
+                publishProgress(progressListener, totalExcelRows, processedRows,
+                        successfulRows, failedRows, skippedRows, currentRow);
+
+                Map<String, String> farmer;
                 try {
-                    Map<String, String> farmer = excelUtil.getRowData(filePath, row);
-                    addFarmerDetails(farmer, driver, wait, longWait);
-
-                    log.info("✅ Farmer row {} insert done", row);
-
-                    try {
-                        Thread.sleep(3500);
-
-                        longWait.until(ExpectedConditions.numberOfElementsToBeMoreThan(
-                                By.xpath("//select[@id='fmrExpYields']/option"), 1
-                        ));
-
-                        List<WebElement> totalFarmersLeft = driver.findElements(
-                                By.xpath("//select[@id='fmrExpYields']/option[not(contains(@style,'display: none'))]")
-                        );
-
-
-
-                        log.info("🌾 Farmers left in dropdown: {}", totalFarmersLeft.size()-1);
-                        log.info("Error Farmer Counts ::" + errorMsgCount);
-
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
+                    farmer = excelUtil.getRowData(filePath, row);
                 } catch (Exception e) {
+                    log.error("❌ Could not read farmer row {}: {}", row, e.getMessage(), e);
+                    excelUtil.writeResult(filePath, row, "FAILED", failureMessage(e));
+                    failedRows++;
+                    processedRows++;
+                    publishProgress(progressListener, totalExcelRows, processedRows,
+                            successfulRows, failedRows, skippedRows, "");
+                    continue;
+                }
 
+                if ("SUCCESS".equalsIgnoreCase(farmer.get("STATUS"))) {
+                    log.info("Skipping previously successful Excel row {}", row);
+                    processedRows++;
+                    successfulRows++;
+                    skippedRows++;
+                    publishProgress(progressListener, totalExcelRows, processedRows,
+                            successfulRows, failedRows, skippedRows, "");
+                    continue;
+                }
+
+                currentRow += ": " + farmer.getOrDefault("Farmer Name", "");
+                publishProgress(progressListener, totalExcelRows, processedRows,
+                        successfulRows, failedRows, skippedRows, currentRow);
+                try {
+                    addFarmerDetailsWithLookupRetries(farmer, driver, wait, longWait);
+                } catch (Exception e) {
                     log.error("❌ Farmer row {} failed: {}", row, e.getMessage(), e);
-                    allSuccess = false;
-
                     if (!isAutomationEnabled) {
+                        excelUtil.writeResult(filePath, row, "PENDING",
+                                "Automation stopped before this row completed");
+                        publishProgress(progressListener, totalExcelRows, processedRows,
+                                successfulRows, failedRows, skippedRows, "");
                         log.warn("Automation stopped by user");
                         break;
                     }
+
+                    excelUtil.writeResult(filePath, row, "FAILED", failureMessage(e));
+                    failedRows++;
+                    processedRows++;
+                    publishProgress(progressListener, totalExcelRows, processedRows,
+                            successfulRows, failedRows, skippedRows, "");
+                    continue;
+                }
+
+                excelUtil.writeResult(filePath, row, "SUCCESS", "Added to appraisal list");
+                successfulRows++;
+                processedRows++;
+                successfulRowIndexes.add(row);
+                publishProgress(progressListener, totalExcelRows, processedRows,
+                        successfulRows, failedRows, skippedRows, "");
+                log.info("Farmer row {} added successfully", row);
+
+                try {
+                    Thread.sleep(3500);
+                    longWait.until(ExpectedConditions.numberOfElementsToBeMoreThan(
+                            By.xpath("//select[@id='fmrExpYields']/option"), 1
+                    ));
+                    List<WebElement> totalFarmersLeft = driver.findElements(
+                            By.xpath("//select[@id='fmrExpYields']/option[not(contains(@style,'display: none'))]")
+                    );
+                    log.info("🌾 Farmers left in dropdown: {}", totalFarmersLeft.size() - 1);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    isAutomationEnabled = false;
                 }
             }
 
-            log.warn("TOTAL AFFECTED FARMERS::" + fallbackFarmers.size());
+            log.info("Rows added: {}, rows failed: {}", successfulRows, failedRows);
+            publishProgress(progressListener, totalExcelRows, processedRows,
+                    successfulRows, failedRows, skippedRows, "");
 
-            if(errorMsgCount==0 && allSuccess) {
-                log.info("All farmers added.. Saving data..");
+            if (!isAutomationEnabled) {
+                for (int row : successfulRowIndexes) {
+                    excelUtil.writeResult(filePath, row, "PENDING",
+                            "Automation stopped before the appraisal list was submitted");
+                }
+            }
+
+            if(successfulRows > 0 && isAutomationEnabled) {
+                log.info("Saving successfully added farmer entries...");
                 // now click
                 WebDriverWait wait2 = new WebDriverWait(driver, Duration.ofSeconds(10));
 
@@ -343,11 +390,17 @@ public class SeleniumAutomationService {
 
             }
         } else {
-            //log.info("Not Proceeding farmers from Excel :: LESS RECORDS PRESENT IN EXCEL SHEET!!");
             log.info("Stopping Automation!!");
             automationStatusStream.notifyStatus("FAILED");
         }
 
+    }
+
+    private void publishProgress(Consumer<AutomationProgress> listener, int totalRows,
+                                 int processedRows, int successfulRows, int failedRows,
+                                 int skippedRows, String currentRow) {
+        listener.accept(new AutomationProgress(totalRows, processedRows, successfulRows,
+                failedRows, skippedRows, currentRow));
     }
 
 
@@ -392,7 +445,54 @@ public class SeleniumAutomationService {
         }
 
         if (!selected) {
-            throw new RuntimeException(cropName + " :: Crop not found");
+            throw new PortalValueNotFoundException(cropName + " :: Crop not found");
+        }
+    }
+
+    private void addFarmerDetailsWithLookupRetries(
+            Map<String, String> farmer,
+            WebDriver driver,
+            WebDriverWait wait,
+            WebDriverWait longWait) {
+
+        for (int attempt = 1; attempt <= MAX_LOOKUP_ATTEMPTS; attempt++) {
+            if (attempt > 1) {
+                log.warn("Retrying farmer row lookup, attempt {}/{} for {}",
+                        attempt, MAX_LOOKUP_ATTEMPTS, farmer.get("Farmer Name"));
+                resetEntryForm(driver);
+            }
+
+            try {
+                addFarmerDetails(farmer, driver, wait, longWait);
+                return;
+            } catch (PortalValueNotFoundException e) {
+                if (attempt == MAX_LOOKUP_ATTEMPTS) {
+                    throw new PortalValueNotFoundException(
+                            "Value not found after " + MAX_LOOKUP_ATTEMPTS
+                                    + " attempts: " + e.getMessage(), e);
+                }
+                log.warn("Lookup failed on attempt {}/{} for {}: {}",
+                        attempt, MAX_LOOKUP_ATTEMPTS, farmer.get("Farmer Name"), e.getMessage());
+            }
+        }
+    }
+
+    private void resetEntryForm(WebDriver driver) {
+        for (String id : List.of("fmrExpYields", "cgName", "cropName")) {
+            List<WebElement> elements = driver.findElements(By.id(id));
+            if (!elements.isEmpty()) {
+                Select select = new Select(elements.get(0));
+                if (!select.getOptions().isEmpty()) {
+                    select.selectByIndex(0);
+                }
+            }
+        }
+
+        for (String id : List.of("areaShowInHa", "expQuintals", "selfQuintals")) {
+            List<WebElement> elements = driver.findElements(By.id(id));
+            if (!elements.isEmpty()) {
+                elements.get(0).clear();
+            }
         }
     }
 
@@ -526,8 +626,8 @@ public class SeleniumAutomationService {
             boolean matched = selectMatchingFarmer(farmerName, driver, wait);
 
             if (!matched) {
-                showContinueMessage(farmerName);
-                return;
+                throw new PortalValueNotFoundException(
+                        "Farmer not found in portal dropdown: " + farmerName);
             }else {
                 //  ===== Select CG =====
                 WebElement cgDropdown = wait.until(
@@ -554,7 +654,8 @@ public class SeleniumAutomationService {
 
 
                 if (!found) {
-                    throw new RuntimeException("CG name not found (ignore-case): " + cgName);
+                    throw new PortalValueNotFoundException(
+                            "CG name not found (ignore-case): " + cgName);
                 }
 
                 // ===== Wait crop reload =====
@@ -603,7 +704,14 @@ public class SeleniumAutomationService {
                         )
                 );
 
-                addButton.click();
+                ((JavascriptExecutor) driver).executeScript(
+                        "arguments[0].scrollIntoView({block:'center'});", addButton);
+                try {
+                    addButton.click();
+                } catch (ElementClickInterceptedException e) {
+                    log.warn("Add button click was intercepted; retrying the row click directly");
+                    ((JavascriptExecutor) driver).executeScript("arguments[0].click();", addButton);
+                }
 
                 //check errors - Handling for retry
                 WebElement errorLabelCrop = driver.findElement(By.id("cropNameErrMsg"));
@@ -612,41 +720,36 @@ public class SeleniumAutomationService {
 
                 String errorMsgCrop = errorLabelCrop.getText().trim();
                 String errorMsgArea = errorLabelArea.getText().trim();
-
-                if (!errorMsgCrop.isEmpty()) {
-                    log.info("❌ Error message present: {}", errorMsgCrop);
-                    errorMsgCount++;
-                    errorFarmers.add(farmerName + "-cropError");
+                List<String> validationErrors = new ArrayList<>();
+                if (!errorMsgCrop.isEmpty()) validationErrors.add(errorMsgCrop);
+                if (!errorMsgArea.isEmpty()) validationErrors.add(errorMsgArea);
+                if (!validationErrors.isEmpty()) {
+                    throw new IllegalStateException(String.join("; ", validationErrors));
                 }
 
-                if (!errorMsgArea.isEmpty()) {
-                    log.info("❌ Error message present: {}", errorMsgArea);
-                    errorMsgCount++;
-                    errorFarmers.add(farmerName + "-areaError");
-                }
-
-                if (!errorMsgArea.isEmpty() || !errorMsgCrop.isEmpty()) {
-                    fallbackFarmers.add(farmer); // store full farmer row
-                }
-
-                if (errorMsgArea.isEmpty() && errorMsgCrop.isEmpty()) {
-                    log.info("Farmer details added: {}", farmerName);
-                }
-
+                log.info("Farmer details added: {}", farmerName);
             }
             wait.until(ExpectedConditions.presenceOfElementLocated(By.id("fmrExpYields")));
         }
 
     }
 
-    private void showContinueMessage(String farmerName) {
-        countFailed++;
-        log.warn(
-                "⚠️ Farmer not found: {}. Skipping and continuing automation. " +
-                        "Total failed count: {}",
-                farmerName,
-                countFailed
-        );
+    private String failureMessage(Exception e) {
+        String message = e.getMessage();
+        if (message == null || message.isBlank()) {
+            message = e.getClass().getSimpleName();
+        }
+        return message.length() > 32000 ? message.substring(0, 32000) : message;
+    }
+
+    private static class PortalValueNotFoundException extends RuntimeException {
+        private PortalValueNotFoundException(String message) {
+            super(message);
+        }
+
+        private PortalValueNotFoundException(String message, Throwable cause) {
+            super(message, cause);
+        }
     }
 
     private void showFinalAlert(WebDriver driver, int countFailed) {
@@ -668,5 +771,3 @@ public class SeleniumAutomationService {
         alert.accept();
     }
 }
-
-

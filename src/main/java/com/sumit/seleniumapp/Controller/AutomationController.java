@@ -1,12 +1,17 @@
 package com.sumit.seleniumapp.Controller;
 
 import com.sumit.seleniumapp.Dto.ExcelValidationResult;
+import com.sumit.seleniumapp.Dto.AutomationProgress;
 import com.sumit.seleniumapp.Service.SeleniumAutomationService;
 import com.sumit.seleniumapp.Util.ExcelUtil;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.Resource;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
@@ -16,11 +21,15 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.nio.channels.FileChannel;
+import java.nio.ByteBuffer;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 @RestController
 public class AutomationController {
@@ -37,6 +46,8 @@ public class AutomationController {
 
     @Value("${app.upload.dir}")
     private String uploadDirPath;
+
+    private final ConcurrentMap<String, RunInfo> runs = new ConcurrentHashMap<>();
 
     @PostMapping("/validate")
     public ResponseEntity<ExcelValidationResult> validateExcel(
@@ -103,29 +114,49 @@ public class AutomationController {
             @RequestParam("file") MultipartFile file) {
 
         String runId = UUID.randomUUID().toString();
+        RunInfo runInfo = new RunInfo();
+        runs.put(runId, runInfo);
 
         new Thread(() -> {
+            String finalStatus = "FAILED";
+            long logStartPosition = 0;
             try {
-                log.info("Automation started for user :: {}", userId);
-
-                // ✅ Safe writable directory
+                runInfo.status = "RUNNING";
                 Path uploadDir = Paths.get(uploadDirPath);
-
                 Files.createDirectories(uploadDir);
 
-                // ✅ Single, consistent file path
-                Path filePath = uploadDir.resolve(
-                        runId + "_" + file.getOriginalFilename()
-                );
+                Path logPath = Paths.get(logFilePath);
+                if (Files.isRegularFile(logPath)) {
+                    logStartPosition = Files.size(logPath);
+                }
+
+                String filePrefix = safeFilePrefix(userId);
+                Path filePath = uploadDir.resolve(filePrefix + "_Report_status.xlsx");
+                runInfo.logFile = uploadDir.resolve(filePrefix + "_Automation_logs.log");
+
+                log.info("Automation started for user :: {}", userId);
 
                 file.transferTo(filePath.toFile());
+                runInfo.resultFile = filePath;
 
                 log.info("File saved to path :: {}", filePath);
 
-                service.runAutomation(userId, password, year, season, month, fromDate, toDate, filePath.toString());
+                service.runAutomation(userId, password, year, season, month, fromDate, toDate,
+                        filePath.toString(), progress -> runInfo.progress = progress);
+                finalStatus = service.isAutomationEnabled ? "COMPLETED" : "STOPPED";
 
             } catch (Exception e) {
                 log.error("Automation failed", e);
+            } finally {
+                try {
+                    if (runInfo.logFile != null) {
+                        saveRunLog(Paths.get(logFilePath), logStartPosition, runInfo.logFile);
+                    }
+                } catch (IOException e) {
+                    runInfo.logFile = null;
+                    log.error("Unable to save automation session log for run {}", runId, e);
+                }
+                runInfo.status = finalStatus;
             }
         }).start();
 
@@ -134,6 +165,69 @@ public class AutomationController {
         response.put("runId", runId);
 
         return ResponseEntity.ok(response);
+    }
+
+    @GetMapping("/runs/{runId}")
+    public ResponseEntity<Map<String, Object>> getRunStatus(@PathVariable String runId) {
+        RunInfo runInfo = runs.get(runId);
+        if (runInfo == null) {
+            return ResponseEntity.notFound().build();
+        }
+        AutomationProgress progress = runInfo.progress;
+        return ResponseEntity.ok(Map.of(
+                "status", runInfo.status,
+                "resultsAvailable", runInfo.resultFile != null,
+                "logsAvailable", runInfo.logFile != null,
+                "totalRows", progress.totalRows(),
+                "processedRows", progress.processedRows(),
+                "successfulRows", progress.successfulRows(),
+                "failedRows", progress.failedRows(),
+                "skippedRows", progress.skippedRows(),
+                "currentRow", progress.currentRow()));
+    }
+
+    @GetMapping("/runs/{runId}/results")
+    public ResponseEntity<Resource> downloadRunResults(@PathVariable String runId) {
+        RunInfo runInfo = runs.get(runId);
+        if (runInfo == null) {
+            return ResponseEntity.notFound().build();
+        }
+        if ("RUNNING".equals(runInfo.status) || runInfo.resultFile == null) {
+            return ResponseEntity.notFound().build();
+        }
+
+        Path resultFile = runInfo.resultFile;
+        if (!Files.isRegularFile(resultFile)) {
+            return ResponseEntity.notFound().build();
+        }
+
+        return ResponseEntity.ok()
+                .contentType(MediaType.parseMediaType(
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+                .header(HttpHeaders.CONTENT_DISPOSITION,
+                        "attachment; filename=\"" + resultFile.getFileName() + "\"")
+                .body(new FileSystemResource(resultFile));
+    }
+
+    @GetMapping("/runs/{runId}/logs")
+    public ResponseEntity<Resource> downloadRunLogs(@PathVariable String runId) {
+        RunInfo runInfo = runs.get(runId);
+        if (runInfo == null || runInfo.logFile == null
+                || "RUNNING".equals(runInfo.status)
+                || "STARTING".equals(runInfo.status)) {
+            return ResponseEntity.notFound().build();
+        }
+
+        Path logFile = runInfo.logFile;
+        if (!Files.isRegularFile(logFile)) {
+            return ResponseEntity.notFound().build();
+        }
+
+        return ResponseEntity.ok()
+                .contentType(MediaType.TEXT_PLAIN)
+                .header(HttpHeaders.CONTENT_DISPOSITION,
+                        "attachment; filename=\"" + logFile.getFileName() + "\"")
+                .body(new FileSystemResource(logFile));
     }
 
     @PostMapping("/stop")
@@ -165,6 +259,50 @@ public class AutomationController {
 
         } catch (Exception e) {
             return "❌ Unable to read logs: " + e.getMessage();
+        }
+    }
+
+    private static class RunInfo {
+        private volatile String status = "STARTING";
+        private volatile Path resultFile;
+        private volatile Path logFile;
+        private volatile AutomationProgress progress = new AutomationProgress(0, 0, 0, 0, 0, "");
+    }
+
+    private String safeFilePrefix(String userId) {
+        String prefix = userId == null ? "" : userId.trim()
+                .replaceAll("[^A-Za-z0-9._-]+", "_")
+                .replaceAll("^\\.+|\\.+$", "");
+        return prefix.isBlank() ? "user" : prefix;
+    }
+
+    private void saveRunLog(Path sourceLog, long startPosition, Path destination) throws IOException {
+        if (!Files.isRegularFile(sourceLog)) {
+            Files.writeString(destination, "Application log file was not available for this run.",
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            return;
+        }
+
+        try (FileChannel source = FileChannel.open(sourceLog, StandardOpenOption.READ);
+             FileChannel target = FileChannel.open(destination, StandardOpenOption.CREATE,
+                     StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+            long currentSize = source.size();
+            long position = Math.min(startPosition, currentSize);
+            long remaining = currentSize - position;
+            while (remaining > 0) {
+                long transferred = source.transferTo(position, remaining, target);
+                if (transferred <= 0) {
+                    ByteBuffer buffer = ByteBuffer.allocate((int) Math.min(8192, remaining));
+                    source.position(position);
+                    int read = source.read(buffer);
+                    if (read < 0) break;
+                    buffer.flip();
+                    while (buffer.hasRemaining()) target.write(buffer);
+                    transferred = read;
+                }
+                position += transferred;
+                remaining -= transferred;
+            }
         }
     }
 }

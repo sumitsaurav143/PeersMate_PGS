@@ -25,7 +25,11 @@ public class ExcelUtil {
 
 
     public int getRowCount(String filePath) throws Exception {
-        int count = 0;
+        return getDataRowIndexes(filePath).size();
+    }
+
+    public List<Integer> getDataRowIndexes(String filePath) throws Exception {
+        List<Integer> rowIndexes = new ArrayList<>();
 
         try (FileInputStream fis = new FileInputStream(filePath);
              Workbook workbook = WorkbookFactory.create(fis)) {
@@ -35,10 +39,10 @@ public class ExcelUtil {
             for (int i = 1; i <= sheet.getLastRowNum(); i++) {
                 Row row = sheet.getRow(i);
                 if (row == null || isRowEmpty(row)) continue;
-                count++;
+                rowIndexes.add(i);
             }
         }
-        return count;
+        return rowIndexes;
     }
 
     public Map<String, String> getRowData(String filePath, int rowIndex) throws Exception {
@@ -87,7 +91,7 @@ public class ExcelUtil {
             int lastCol = headerRow.getLastCellNum();
 
             for (int i = 0; i < lastCol; i++) {
-                String header = headerRow.getCell(i).getStringCellValue().trim();
+                String header = new DataFormatter().formatCellValue(headerRow.getCell(i)).trim();
                 if ("STATUS".equalsIgnoreCase(header)) statusCol = i;
                 if ("MESSAGE".equalsIgnoreCase(header)) messageCol = i;
             }
@@ -161,11 +165,9 @@ public class ExcelUtil {
             }
 
             // Validate rows
-            for (int r = 1; r <= getRowCount(filePath); r++) {
-
-
+            for (int r = 1; r <= sheet.getLastRowNum(); r++) {
                 Row row = sheet.getRow(r);
-                if (row == null) continue;
+                if (row == null || isRowEmpty(row)) continue;
 
                 List<String> errors = new ArrayList<>();
                 List<String> warnings = new ArrayList<>();
